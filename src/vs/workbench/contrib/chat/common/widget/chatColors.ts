@@ -42,6 +42,12 @@ export const chatSlashCommandForeground = registerColor(
 	localize('chat.slashCommandForeground', 'The foreground color of a chat slash command.')
 );
 
+export const chatSkillUnderline = registerColor(
+	'chat.skillUnderline',
+	{ dark: '#85b6ffcc', light: '#26569ecc', hcDark: contrastBorder, hcLight: contrastBorder },
+	localize('chat.skillUnderline', 'The underline color of words in the chat input that may trigger a skill.')
+);
+
 export const chatAvatarBackground = registerColor(
 	'chat.avatarBackground',
 	{ dark: '#1f1f1f', light: '#f2f2f2', hcDark: Color.black, hcLight: Color.white, },

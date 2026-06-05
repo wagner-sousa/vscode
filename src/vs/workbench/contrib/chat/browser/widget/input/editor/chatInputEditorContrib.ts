@@ -19,7 +19,11 @@ import { inputPlaceholderForeground } from '../../../../../../../platform/theme/
 import { IThemeService } from '../../../../../../../platform/theme/common/themeService.js';
 import { IChatAgentCommand, IChatAgentData, IChatAgentService } from '../../../../common/participants/chatAgents.js';
 import { localize } from '../../../../../../../nls.js';
-import { chatSlashCommandBackground, chatSlashCommandForeground } from '../../../../common/widget/chatColors.js';
+import { chatSkillUnderline, chatSlashCommandBackground, chatSlashCommandForeground } from '../../../../common/widget/chatColors.js';
+import { IAgentSkill, IPromptsService } from '../../../../common/promptSyntax/service/promptsService.js';
+import { isSkillFilename } from '../../../../common/promptSyntax/config/promptFileLocations.js';
+import { basename } from '../../../../../../../base/common/resources.js';
+import { computeSkillKeywords } from './chatSkillKeywords.js';
 import { ChatRequestAgentPart, ChatRequestAgentSubcommandPart, ChatRequestDynamicVariablePart, ChatRequestSlashCommandPart, ChatRequestSlashPromptPart, ChatRequestTextPart, ChatRequestToolPart, ChatRequestToolSetPart, IParsedChatRequestPart, chatAgentLeader, chatSubcommandLeader } from '../../../../common/requestParser/chatParserTypes.js';
 import { agentReg, slashReg, variableReg } from '../../../../common/requestParser/chatRequestParser.js';
 import { IChatWidget } from '../../../chat.js';
@@ -27,7 +31,7 @@ import { ChatWidget } from '../../chatWidget.js';
 import { dynamicVariableDecorationType } from '../../../attachments/chatDynamicVariables.js';
 import { NativeEditContextRegistry } from '../../../../../../../editor/browser/controller/editContext/native/nativeEditContextRegistry.js';
 import { TextAreaEditContextRegistry } from '../../../../../../../editor/browser/controller/editContext/textArea/textAreaEditContextRegistry.js';
-import { CancellationToken } from '../../../../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../../../../base/common/cancellation.js';
 import { ThrottledDelayer } from '../../../../../../../base/common/async.js';
 import { isCancellationError } from '../../../../../../../base/common/errors.js';
 import { IEditorService } from '../../../../../../services/editor/common/editorService.js';
@@ -39,6 +43,7 @@ const placeholderDecorationType = 'chat-session-detail';
 const slashCommandTextDecorationType = 'chat-session-text';
 const clickableSlashPromptTextDecorationType = 'chat-session-clickable-text';
 const variableTextDecorationType = 'chat-variable-text';
+const skillHeuristicDecorationType = 'chat-skill-heuristic';
 
 function agentAndCommandToKey(agent: IChatAgentData, subcommand: string | undefined): string {
 	return subcommand ? `${agent.id}__${subcommand}` : agent.id;
@@ -77,6 +82,15 @@ class InputEditorDecorations extends Disposable {
 	private clickablePromptSlashCommand: { range: Range; uri: URI } | undefined;
 	private mouseDownPromptSlashCommand: { position: Position; uri: URI; range: Range } | undefined;
 
+	/**
+	 * Cache of the available skills. {@link IPromptsService.findAgentSkills} scans
+	 * disk, so it must not be called on every keystroke; instead it is refreshed
+	 * once and whenever {@link IPromptsService.onDidChangeSkills} fires.
+	 */
+	private skills: readonly IAgentSkill[] = [];
+	/** Lazily-built map from a meaningful keyword to the skills it can trigger. */
+	private skillKeywordIndex: Map<string, IAgentSkill[]> | undefined;
+
 	private readonly viewModelDisposables = this._register(new MutableDisposable());
 
 
@@ -90,10 +104,13 @@ class InputEditorDecorations extends Disposable {
 		@ILabelService private readonly labelService: ILabelService,
 		@ICustomizationHarnessService private readonly customizationHarnessService: ICustomizationHarnessService,
 		@IEditorService private readonly editorService: IEditorService,
+		@IPromptsService private readonly promptsService: IPromptsService,
 	) {
 		super();
 
 		this.registeredDecorationTypes();
+		this.refreshSkills();
+		this._register(this.promptsService.onDidChangeSkills(() => this.refreshSkills()));
 		this.triggerInputEditorDecorationsUpdate();
 		this._register(this.widget.inputEditor.onDidChangeModelContent(() => this.triggerInputEditorDecorationsUpdate()));
 		this._register(this.widget.onDidChangeParsedInput(() => this.triggerInputEditorDecorationsUpdate()));
@@ -166,6 +183,55 @@ class InputEditorDecorations extends Disposable {
 		});
 	}
 
+	private readonly skillsRefreshCts = this._register(new MutableDisposable<CancellationTokenSource>());
+
+	private async refreshSkills(): Promise<void> {
+		const cts = this.skillsRefreshCts.value = new CancellationTokenSource();
+		const skills = await this.promptsService.findAgentSkills(cts.token);
+		if (cts.token.isCancellationRequested) {
+			return;
+		}
+		this.skills = skills ?? [];
+		this.skillKeywordIndex = undefined; // invalidate, rebuilt lazily
+		this.triggerInputEditorDecorationsUpdate();
+	}
+
+	/** Find a skill that matches the given prompt slash command, if any. */
+	private findSkillForPrompt(name: string, uri: URI): IAgentSkill | undefined {
+		// Only the file backing a skill is named SKILL.md, so a non-skill prompt can be ruled out early.
+		if (!isSkillFilename(basename(uri))) {
+			return undefined;
+		}
+		const uriString = uri.toString();
+		return this.skills.find(s => s.uri.toString() === uriString || s.name === name);
+	}
+
+	/**
+	 * Map from a meaningful keyword to the skills that the model could auto-invoke
+	 * when that keyword appears in the message. Only skills with model invocation
+	 * enabled are indexed. Built lazily and cached until the skill list changes.
+	 */
+	private getSkillKeywordIndex(): Map<string, IAgentSkill[]> {
+		if (!this.skillKeywordIndex) {
+			const index = new Map<string, IAgentSkill[]>();
+			for (const skill of this.skills) {
+				if (skill.disableModelInvocation) {
+					continue; // only `/name`-invocable, never auto-triggered by free text
+				}
+				for (const keyword of computeSkillKeywords(skill)) {
+					const existing = index.get(keyword);
+					if (existing) {
+						existing.push(skill);
+					} else {
+						index.set(keyword, [skill]);
+					}
+				}
+			}
+			this.skillKeywordIndex = index;
+		}
+		return this.skillKeywordIndex;
+	}
+
 	private registeredDecorationTypes() {
 		this._register(this.codeEditorService.registerDecorationType(decorationDescription, placeholderDecorationType, {}));
 		this._register(this.codeEditorService.registerDecorationType(decorationDescription, slashCommandTextDecorationType, {
@@ -188,6 +254,13 @@ class InputEditorDecorations extends Disposable {
 			color: themeColorFromId(chatSlashCommandForeground),
 			backgroundColor: themeColorFromId(chatSlashCommandBackground),
 			borderRadius: '3px',
+			rangeBehavior: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
+		}));
+		// Heuristic skill triggers: a discreet dotted underline (no background) to signal
+		// that this is a hint about a skill that *may* be auto-invoked, not a committed token.
+		this._register(this.codeEditorService.registerDecorationType(decorationDescription, skillHeuristicDecorationType, {
+			color: themeColorFromId(chatSkillUnderline),
+			textDecoration: 'underline dotted',
 			rangeBehavior: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
 		}));
 	}
@@ -366,6 +439,12 @@ class InputEditorDecorations extends Disposable {
 				uri: promptSlashCommand.uri,
 			};
 			const promptHoverMessage = new MarkdownString();
+			// If this prompt slash command resolves to a skill, surface the skill name explicitly.
+			const skill = this.findSkillForPrompt(slashPromptPart.name, promptSlashCommand.uri);
+			if (skill) {
+				promptHoverMessage.appendMarkdown(localize('chatInput.skill', "**Skill:** {0}", skill.name));
+				promptHoverMessage.appendText('\n');
+			}
 			if (promptSlashCommand.description) {
 				promptHoverMessage.appendText(promptSlashCommand.description);
 				promptHoverMessage.appendText('\n');
@@ -400,6 +479,55 @@ class InputEditorDecorations extends Disposable {
 		}
 
 		this.widget.inputEditor.setDecorationsByType(decorationDescription, variableTextDecorationType, varDecorations);
+
+		this.updateSkillHeuristicDecorations(parsedRequest);
+	}
+
+	/**
+	 * Underline words in the free-text parts of the message that match a keyword of an
+	 * auto-invocable skill (derived from its name and description). This is a heuristic
+	 * hint — the actual decision is made by the model — communicated by a dotted underline
+	 * and a "may trigger" hover, distinct from the solid highlight of explicit `/skill` tokens.
+	 */
+	private updateSkillHeuristicDecorations(parsedRequest: readonly IParsedChatRequestPart[]): void {
+		const model = this.widget.inputEditor.getModel();
+		const keywordIndex = this.getSkillKeywordIndex();
+		const decorations: IDecorationOptions[] = [];
+
+		if (model && keywordIndex.size) {
+			const wordReg = /[\p{L}\p{N}][\p{L}\p{N}_-]*/gu;
+			for (const part of parsedRequest) {
+				if (!(part instanceof ChatRequestTextPart) || !part.text.trim()) {
+					continue; // only free text triggers the heuristic
+				}
+				for (const match of part.text.matchAll(wordReg)) {
+					const skills = keywordIndex.get(match[0].toLowerCase());
+					if (!skills) {
+						continue;
+					}
+					const startOffset = part.range.start + match.index;
+					const range = Range.fromPositions(
+						model.getPositionAt(startOffset),
+						model.getPositionAt(startOffset + match[0].length),
+					);
+					decorations.push({ range, hoverMessage: this.getSkillHeuristicHover(skills) });
+				}
+			}
+		}
+
+		this.widget.inputEditor.setDecorationsByType(decorationDescription, skillHeuristicDecorationType, decorations);
+	}
+
+	private getSkillHeuristicHover(skills: readonly IAgentSkill[]): MarkdownString {
+		const hover = new MarkdownString();
+		for (const skill of skills) {
+			hover.appendMarkdown(localize('chatInput.maySkill', "**May trigger skill:** {0}", skill.name));
+			if (skill.description) {
+				hover.appendText(`\n${skill.description}`);
+			}
+			hover.appendText('\n');
+		}
+		return hover;
 	}
 
 	private updateAriaPlaceholder(value: string | undefined): void {
